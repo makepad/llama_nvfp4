@@ -2182,6 +2182,12 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
+    // ModelOpt NVFP4 matmuls may carry an auxiliary input_scale in src[3].
+    // Current fused GLU paths do not consume that metadata.
+    if (ffn_up->src[3] || ffn_gate->src[3]) {
+        return false;
+    }
+
     static constexpr std::array<ggml_glu_op, 3> valid_glu_ops = { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI };
 
     if (std::find(valid_glu_ops.begin(), valid_glu_ops.end(), ggml_get_glu_op(glu)) == valid_glu_ops.end()) {
@@ -2339,8 +2345,18 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     bool use_batched_cublas_f16  = src0->type == GGML_TYPE_F16 && (src1->type == GGML_TYPE_F16 || !any_gpus_with_slow_fp16);
     bool use_batched_cublas_bf16 = src0->type == GGML_TYPE_BF16 && bf16_mma_hardware_available(cc);
     bool use_batched_cublas_f32  = src0->type == GGML_TYPE_F32;
+    const bool use_nvfp4_modelopt_vec =
+        !split &&
+        src0->type == GGML_TYPE_NVFP4 &&
+        dst->src[3] != nullptr &&
+        ggml_is_scalar(dst->src[3]) &&
+        src1->type == GGML_TYPE_F32 &&
+        dst->type == GGML_TYPE_F32 &&
+        src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 
-    if (!split && use_mul_mat_vec_f) {
+    if (use_nvfp4_modelopt_vec) {
+        ggml_cuda_mul_mat_vec_nvfp4_modelopt(ctx, src0, src1, dst);
+    } else if (!split && use_mul_mat_vec_f) {
         // the custom F16 vector kernel can be used over batched cuBLAS GEMM
         // but this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);

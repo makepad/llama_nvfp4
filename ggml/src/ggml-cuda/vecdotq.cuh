@@ -354,6 +354,111 @@ static __device__ __forceinline__ float vec_dot_nvfp4_q8_1(
 
     return sum;
 }
+
+static __device__ __forceinline__ float vec_dot_nvfp4_q8_1_modelopt(
+                                        const void * __restrict__ vbq,
+                                        const block_q8_1 * __restrict__ bq8_1,
+                                        const int32_t & kbx,
+                                        const int32_t & iqs) {
+
+    const block_nvfp4 * bq4 = (const block_nvfp4 *) vbq + kbx;
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < VDR_NVFP4_Q8_1_MMVQ/2; i++) {
+        const int32_t iqs0 = iqs + 2*i;
+        const int32_t iqs1 = iqs0 + 1;
+        const int32_t is = iqs0 >> 1;
+        const int2 v0 = get_int_from_table_16(get_int_b4(bq4->qs, iqs0), kvalues_mxfp4);
+        const int2 v1 = get_int_from_table_16(get_int_b4(bq4->qs, iqs1), kvalues_mxfp4);
+        const block_q8_1 * bq8 = bq8_1 + (is >> 1);
+        const int32_t i8 = ((is & 1) << 2);
+
+        int sumi = ggml_cuda_dp4a(v0.x, get_int_b4(bq8->qs, i8 + 0), 0);
+        sumi = ggml_cuda_dp4a(v0.y, get_int_b4(bq8->qs, i8 + 2), sumi);
+        sumi = ggml_cuda_dp4a(v1.x, get_int_b4(bq8->qs, i8 + 1), sumi);
+        sumi = ggml_cuda_dp4a(v1.y, get_int_b4(bq8->qs, i8 + 3), sumi);
+
+        // GGUF NVFP4 weights store block scales in ggml's UE4M3-in-block format.
+        // The converter repacks ModelOpt weight_scale into this layout up front,
+        // so the CUDA matvec must decode weight scales the same way as the
+        // regular ggml NVFP4 path.
+        const float d = ggml_cuda_ue4m3_to_fp32(bq4->d[is]) * __low2float(bq8->ds);
+        sum += d * float(sumi);
+    }
+
+    return sum;
+}
+
+#define VDR_NVFP4_NVFP4_MMVQ 4
+
+static __device__ __forceinline__ float vec_dot_nvfp4_nvfp4(
+                                        const void * __restrict__ vx,
+                                        const block_nvfp4 * __restrict__ vy,
+                                        const int32_t & kbx,
+                                        const int32_t & iqs) {
+
+    const block_nvfp4 * bx = (const block_nvfp4 *) vx + kbx;
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < VDR_NVFP4_NVFP4_MMVQ/2; ++i) {
+        const int32_t iqs0 = iqs + 2*i;
+        const int32_t iqs1 = iqs0 + 1;
+        const int32_t is = iqs0 >> 1;
+
+        const int2 x0 = get_int_from_table_16(get_int_b4(bx->qs, iqs0), kvalues_mxfp4);
+        const int2 x1 = get_int_from_table_16(get_int_b4(bx->qs, iqs1), kvalues_mxfp4);
+        const int2 y0 = get_int_from_table_16(get_int_b4(vy->qs, iqs0), kvalues_mxfp4);
+        const int2 y1 = get_int_from_table_16(get_int_b4(vy->qs, iqs1), kvalues_mxfp4);
+
+        int sumi = ggml_cuda_dp4a(x0.x, y0.x, 0);
+        sumi = ggml_cuda_dp4a(x0.y, y0.y, sumi);
+        sumi = ggml_cuda_dp4a(x1.x, y1.x, sumi);
+        sumi = ggml_cuda_dp4a(x1.y, y1.y, sumi);
+
+        const float d = ggml_cuda_ue4m3_to_fp32(bx->d[is]) * ggml_cuda_ue4m3_to_fp32(vy->d[is]);
+        sum += d * float(sumi);
+    }
+
+    return sum;
+}
+
+static __device__ __forceinline__ float vec_dot_nvfp4_nvfp4_modelopt(
+                                        const void * __restrict__ vx,
+                                        const block_nvfp4 * __restrict__ vy,
+                                        const int32_t & kbx,
+                                        const int32_t & iqs) {
+
+    const block_nvfp4 * bx = (const block_nvfp4 *) vx + kbx;
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < VDR_NVFP4_NVFP4_MMVQ/2; ++i) {
+        const int32_t iqs0 = iqs + 2*i;
+        const int32_t iqs1 = iqs0 + 1;
+        const int32_t is = iqs0 >> 1;
+
+        const int2 x0 = get_int_from_table_16(get_int_b4(bx->qs, iqs0), kvalues_mxfp4);
+        const int2 x1 = get_int_from_table_16(get_int_b4(bx->qs, iqs1), kvalues_mxfp4);
+        const int2 y0 = get_int_from_table_16(get_int_b4(vy->qs, iqs0), kvalues_mxfp4);
+        const int2 y1 = get_int_from_table_16(get_int_b4(vy->qs, iqs1), kvalues_mxfp4);
+
+        int sumi = ggml_cuda_dp4a(x0.x, y0.x, 0);
+        sumi = ggml_cuda_dp4a(x0.y, y0.y, sumi);
+        sumi = ggml_cuda_dp4a(x1.x, y1.x, sumi);
+        sumi = ggml_cuda_dp4a(x1.y, y1.y, sumi);
+
+        // kvalues_mxfp4 stores 2x the E2M1 values, so both local scales must
+        // contribute the matching 0.5 factor. GGUF weight blocks already use
+        // UE4M3 decode with that compensation built in; ModelOpt activation
+        // block scales are stored as raw E4M3FN, so we apply the 0.5 here.
+        const float d = ggml_cuda_ue4m3_to_fp32(bx->d[is]) * (0.5f * ggml_cuda_e4m3fn_to_fp32(vy->d[is]));
+        sum += d * float(sumi);
+    }
+
+    return sum;
+}
+
 #define VDR_Q2_K_Q8_1_MMVQ 1
 #define VDR_Q2_K_Q8_1_MMQ  4
 

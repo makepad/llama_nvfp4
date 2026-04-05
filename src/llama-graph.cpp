@@ -71,6 +71,37 @@ static ggml_tensor * ggml_mul_mat_aux(
     return res;
 }
 
+static ggml_tensor * ggml_mul_mat_modelopt(
+        ggml_context * ctx,
+        ggml_tensor * w,
+        ggml_tensor * in,
+        ggml_tensor * input_scale) {
+    ggml_tensor * res = ggml_mul_mat(ctx, w, in);
+
+    // Keep real ModelOpt input_scale attached to the matmul for CUDA NVFP4.
+    // This avoids the incorrect x *= input_scale approximation in the graph.
+    if (input_scale && w->type == GGML_TYPE_NVFP4) {
+        res->src[3] = input_scale;
+    }
+
+    return res;
+}
+
+static ggml_tensor * ggml_mul_mat_id_modelopt(
+        ggml_context * ctx,
+        ggml_tensor * w,
+        ggml_tensor * in,
+        ggml_tensor * ids,
+        ggml_tensor * input_scale) {
+    ggml_tensor * res = ggml_mul_mat_id(ctx, w, in, ids);
+
+    if (input_scale && w->type == GGML_TYPE_NVFP4) {
+        res->src[3] = input_scale;
+    }
+
+    return res;
+}
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -963,7 +994,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         mm_in = ggml_mul(ctx0, mm_in, w_in_s);
     }
 
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, mm_in);
+    ggml_tensor * res = ggml_mul_mat_modelopt(ctx0, w, mm_in, w_in_s);
 
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
@@ -1011,7 +1042,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         }
     }
 
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, mm_in, ids);
+    ggml_tensor * res = ggml_mul_mat_id_modelopt(ctx0, w, mm_in, ids, w_in_s);
     if (mm_out_s) {
         res = ggml_mul(ctx0, res, mm_out_s);
     }

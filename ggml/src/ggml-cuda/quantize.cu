@@ -47,6 +47,118 @@ static __global__ void quantize_q8_1(
     y[ib].ds = make_half2(d, sum);
 }
 
+static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3(float x) {
+    if (!(x > 0.0f)) {
+        return 0;
+    }
+
+    uint8_t best = 0;
+    float best_err = x;
+
+    for (uint32_t i = 1; i < 0x7F; ++i) {
+        const uint8_t ue = (uint8_t) i;
+        const float v = ggml_cuda_ue4m3_to_fp32(ue);
+        const float err = fabsf(v - x);
+        if (err < best_err) {
+            best = ue;
+            best_err = err;
+        }
+    }
+
+    return best;
+}
+
+static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_e4m3fn(float x) {
+    if (!(x > 0.0f)) {
+        return 0;
+    }
+
+    uint8_t best = 0;
+    float best_err = x;
+
+    for (uint32_t i = 1; i < 0x7F; ++i) {
+        const uint8_t e4m3 = (uint8_t) i;
+        const float v = ggml_cuda_e4m3fn_to_fp32(e4m3);
+        const float err = fabsf(v - x);
+        if (err < best_err) {
+            best = e4m3;
+            best_err = err;
+        }
+    }
+
+    return best;
+}
+
+__launch_bounds__(QK_NVFP4, 1)
+static __global__ void quantize_nvfp4(
+        const float * __restrict__ x,
+        const float * __restrict__ input_scale,
+        void * __restrict__ vy,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const uint32_t ne1, const uint3 ne2) {
+    const int lane = threadIdx.x;
+    const int64_t block_start = (int64_t) blockIdx.x * QK_NVFP4;
+
+    if (block_start >= ne0) {
+        return;
+    }
+
+    const int64_t i3 = fastdiv(blockIdx.z, ne2);
+    const int64_t i2 = blockIdx.z - i3*ne2.z;
+    const int64_t i1 = blockIdx.y;
+
+    const float in_s_raw = input_scale ? input_scale[0] : 1.0f;
+    const float in_s = in_s_raw != 0.0f ? in_s_raw : 1.0f;
+    const float in_s_inv = in_s != 0.0f ? 1.0f / in_s : 1.0f;
+
+    const int64_t i00 = block_start + lane;
+    const float xi = i00 < ne00 ? x[i3*s03 + i2*s02 + i1*s01 + i00] : 0.0f;
+
+    const int sub = lane / QK_NVFP4_SUB;
+    const int lane_sub = lane % QK_NVFP4_SUB;
+    const int64_t ib = ((i3*ne2.z + i2) * ne1 + i1) * (ne0 / QK_NVFP4) + blockIdx.x;
+
+    __shared__ uint8_t q_shared[QK_NVFP4];
+    __shared__ float d_shared[QK_NVFP4 / QK_NVFP4_SUB];
+
+    float amax = fabsf(xi);
+    amax = warp_reduce_max<QK_NVFP4_SUB>(amax);
+
+    if (lane_sub == 0) {
+        // Match ModelOpt / vLLM semantics:
+        // - quantize the activation values themselves against the local scale
+        // - store the rounded local scale divided by input_scale
+        // - reintroduce input_scale in the matvec kernel
+        uint8_t e4m3;
+#if CUDART_VERSION >= 12080
+        e4m3 = __nv_cvt_float_to_fp8((amax / 6.0f) * in_s_inv, __NV_SATFINITE, __NV_E4M3);
+#else
+        e4m3 = ggml_cuda_fp32_to_e4m3fn((amax / 6.0f) * in_s_inv);
+#endif
+        ((block_nvfp4 *) vy)[ib].d[sub] = e4m3;
+        d_shared[sub] = ggml_cuda_e4m3fn_to_fp32(e4m3);
+    }
+
+    __syncthreads();
+
+    const float d = d_shared[sub] * in_s;
+    const float d_inv = d != 0.0f ? 1.0f / d : 0.0f;
+
+#if CUDART_VERSION >= 12080
+    q_shared[lane] = __nv_cvt_float_to_fp4(xi * d_inv, __NV_E2M1, cudaRoundNearest) & 0x0F;
+#else
+    q_shared[lane] = ggml_cuda_float_to_fp4_e2m1(xi, d_inv);
+#endif
+
+    __syncthreads();
+
+    if (lane_sub < QK_NVFP4_SUB/2) {
+        ((block_nvfp4 *) vy)[ib].qs[sub*(QK_NVFP4_SUB/2) + lane_sub] =
+            q_shared[sub*QK_NVFP4_SUB + lane_sub] |
+            (q_shared[sub*QK_NVFP4_SUB + lane_sub + QK_NVFP4_SUB/2] << 4);
+    }
+}
+
 __device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
     if (!(amax > 0.0f)) {
         return 0;
@@ -284,6 +396,28 @@ void quantize_row_q8_1_cuda(
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
     quantize_q8_1<<<num_blocks, block_size, 0, stream>>>(x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
     GGML_UNUSED(type_src0);
+}
+
+void quantize_row_nvfp4_cuda(
+        const float * x,
+        const float * input_scale,
+        void * vy,
+        const int64_t ne00,
+        const int64_t s01,
+        const int64_t s02,
+        const int64_t s03,
+        const int64_t ne0,
+        const int64_t ne1,
+        const int64_t ne2,
+        const int64_t ne3,
+        cudaStream_t stream) {
+    GGML_ASSERT(ne0 % QK_NVFP4 == 0);
+
+    const uint3 ne2_fastdiv = init_fastdiv_values(ne2);
+
+    const dim3 num_blocks(ne0 / QK_NVFP4, ne1, ne2*ne3);
+    const dim3 block_size(QK_NVFP4, 1, 1);
+    quantize_nvfp4<<<num_blocks, block_size, 0, stream>>>(x, input_scale, vy, ne00, s01, s02, s03, ne0, (uint32_t) ne1, ne2_fastdiv);
 }
 
 void quantize_mmq_q8_1_cuda(

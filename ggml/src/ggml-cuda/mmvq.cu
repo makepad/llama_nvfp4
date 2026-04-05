@@ -588,6 +588,95 @@ static __global__ void mul_mat_vec_q(
     }
 }
 
+template <int ncols_dst, bool small_k = false>
+__launch_bounds__(calc_nwarps(GGML_TYPE_NVFP4, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_nvfp4_modelopt(
+        const block_nvfp4 * __restrict__ vx,
+        const block_nvfp4 * __restrict__ vy,
+        const float * __restrict__ input_scale,
+        float * __restrict__ dst,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
+        const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
+        const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
+        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst) {
+
+    constexpr int qk  = ggml_cuda_type_traits<GGML_TYPE_NVFP4>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<GGML_TYPE_NVFP4>::qi;
+    constexpr int vdr = VDR_NVFP4_NVFP4_MMVQ;
+    constexpr mmvq_parameter_table_id table_id = get_device_table_id();
+    constexpr int nwarps = calc_nwarps(GGML_TYPE_NVFP4, ncols_dst, table_id);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    const int tid = warp_size*threadIdx.y + threadIdx.x;
+    const int row0 = rows_per_cuda_block*blockIdx.x;
+    const int blocks_per_row_x = ncols_x / qk;
+    constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
+
+    const uint32_t channel_dst = blockIdx.y;
+    const uint32_t channel_x = fastdiv(channel_dst, channel_ratio);
+    const uint32_t channel_y = channel_dst;
+    const uint32_t sample_dst = blockIdx.z;
+    const uint32_t sample_x = fastdiv(sample_dst, sample_ratio);
+    const uint32_t sample_y = sample_dst;
+
+    float tmp[ncols_dst][rows_per_cuda_block] = {{0.0f}};
+
+    const block_nvfp4 * y = vy + sample_y*stride_sample_y + channel_y*stride_channel_y;
+    const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
+
+    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx;
+        const int kqs = vdr * (tid % (qi/vdr));
+
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                tmp[j][i] += vec_dot_nvfp4_nvfp4_modelopt(
+                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            }
+        }
+    }
+
+    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
+
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) {
+        return;
+    }
+
+    const float in_s_raw = input_scale ? input_scale[0] : 1.0f;
+    const float in_s = in_s_raw != 0.0f ? in_s_raw : 1.0f;
+
+    dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
+
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+        for (int i = 0; i < rows_per_cuda_block; ++i) {
+#pragma unroll
+            for (int l = 0; l < nwarps-1; ++l) {
+                tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
+            }
+            tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]) * in_s;
+        }
+
+        if (threadIdx.x < rows_per_cuda_block && (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
+            dst[j*stride_col_dst + threadIdx.x] = tmp[j][threadIdx.x];
+        }
+    }
+}
+
 // Dedicated MoE multi-token kernel.
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
@@ -661,6 +750,50 @@ static std::pair<dim3, dim3> calc_launch_params(
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
     return {block_nums, block_dims};
+}
+
+template<int c_ncols_dst, bool small_k = false>
+static void mul_mat_vec_nvfp4_modelopt_switch(
+        const block_nvfp4 * vx, const block_nvfp4 * vy, const float * input_scale, float * dst,
+        const uint32_t ncols_x, const uint32_t nchannels_y, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint32_t nchannels_x, const uint32_t nchannels_dst,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const uint32_t nsamples_x, const uint32_t nsamples_dst,
+        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
+        cudaStream_t stream) {
+    const int warp_size = WARP_SIZE;
+    const mmvq_parameter_table_id table_id = get_device_table_id(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+    std::pair<dim3, dim3> dims = calc_launch_params<GGML_TYPE_NVFP4>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, small_k);
+    const uint3 nchannels_y_fd = init_fastdiv_values(nchannels_y);
+    const uint3 channel_ratio_fd = init_fastdiv_values(nchannels_dst / nchannels_x);
+    const uint3 sample_ratio_fd = init_fastdiv_values(nsamples_dst / nsamples_x);
+    mul_mat_vec_nvfp4_modelopt<c_ncols_dst, small_k><<<dims.first, dims.second, 0, stream>>>(
+        vx, vy, input_scale, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+        channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+        sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst);
+}
+
+static void mul_mat_vec_nvfp4_modelopt_switch_ncols_dst(
+        const block_nvfp4 * vx, const block_nvfp4 * vy, const float * input_scale, float * dst,
+        const uint32_t ncols_x, const uint32_t nchannels_y, const uint32_t nrows_x, const uint32_t ncols_dst,
+        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint32_t nchannels_x, const uint32_t nchannels_dst,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const uint32_t nsamples_x, const uint32_t nsamples_dst,
+        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
+        cudaStream_t stream) {
+    switch (ncols_dst) {
+        case 1: mul_mat_vec_nvfp4_modelopt_switch<1>(vx, vy, input_scale, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst, nchannels_x, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream); break;
+        case 2: mul_mat_vec_nvfp4_modelopt_switch<2>(vx, vy, input_scale, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst, nchannels_x, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream); break;
+        case 3: mul_mat_vec_nvfp4_modelopt_switch<3>(vx, vy, input_scale, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst, nchannels_x, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream); break;
+        case 4: mul_mat_vec_nvfp4_modelopt_switch<4>(vx, vy, input_scale, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst, nchannels_x, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream); break;
+        case 5: mul_mat_vec_nvfp4_modelopt_switch<5>(vx, vy, input_scale, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst, nchannels_x, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream); break;
+        case 6: mul_mat_vec_nvfp4_modelopt_switch<6>(vx, vy, input_scale, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst, nchannels_x, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream); break;
+        case 7: mul_mat_vec_nvfp4_modelopt_switch<7>(vx, vy, input_scale, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst, nchannels_x, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream); break;
+        case 8: mul_mat_vec_nvfp4_modelopt_switch<8>(vx, vy, input_scale, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst, nchannels_x, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream); break;
+        default: GGML_ABORT("fatal error"); break;
+    }
 }
 
 template<ggml_type type, int c_ncols_dst, bool small_k = false>
@@ -1016,6 +1149,72 @@ static void mul_mat_vec_q_switch_type(
             GGML_ABORT("fatal error");
             break;
     }
+}
+
+void ggml_cuda_mul_mat_vec_nvfp4_modelopt(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        ggml_tensor * dst) {
+    GGML_ASSERT(src0->type == GGML_TYPE_NVFP4);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+    GGML_ASSERT(ne12 <= MMVQ_MAX_BATCH_SIZE);
+
+    const ggml_tensor * input_scale = dst->src[3];
+    GGML_ASSERT(input_scale != nullptr);
+    GGML_ASSERT(ggml_is_scalar(input_scale));
+
+    cudaStream_t stream = ctx.stream();
+
+    const size_t ts_src0 = ggml_type_size(src0->type);
+    const size_t ts_src1 = ggml_type_size(src1->type);
+    const size_t ts_dst  = ggml_type_size(dst->type);
+
+    GGML_ASSERT(nb00 == ts_src0);
+    GGML_ASSERT(nb10 == ts_src1);
+    GGML_ASSERT(nb0  == ts_dst);
+
+    const float * src1_d = (const float *) src1->data;
+    float * dst_d = (float *) dst->data;
+    const float * input_scale_d = (const float *) input_scale->data;
+
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    ggml_cuda_pool_alloc<char> src1_nvfp4(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_nvfp4)/QK_NVFP4);
+    {
+        const int64_t s11 = src1->nb[1] / ts_src1;
+        const int64_t s12 = src1->nb[2] / ts_src1;
+        const int64_t s13 = src1->nb[3] / ts_src1;
+        quantize_row_nvfp4_cuda(src1_d, input_scale_d, src1_nvfp4.get(), ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+    }
+
+    const int64_t s01 = src0->nb[1] / ts_src0;
+    const int64_t s11 = ne10_padded / QK_NVFP4;
+    const int64_t s1  = dst->nb[1] / ts_dst;
+    const int64_t s02 = src0->nb[2] / ts_src0;
+    const int64_t s2  = dst->nb[2] / ts_dst;
+    const int64_t s03 = src0->nb[3] / ts_src0;
+    const int64_t s3  = dst->nb[3] / ts_dst;
+    const int64_t s12 = ne11*s11;
+    const int64_t s13 = ne12*s12;
+
+    const int64_t ncols_dst = ne1;
+    const int64_t nchannels_y = ne12;
+    const int64_t nchannels_dst = ne2;
+    const int64_t stride_col_dst = s1;
+    const int64_t stride_col_y = s11;
+    const int64_t stride_channel_dst = s2;
+    const int64_t stride_channel_y = s12;
+
+    mul_mat_vec_nvfp4_modelopt_switch_ncols_dst(
+        (const block_nvfp4 *) src0->data, (const block_nvfp4 *) src1_nvfp4.get(), input_scale_d, dst_d, ne00,
+        nchannels_y, ne01, (uint32_t) ncols_dst,
+        s01, stride_col_y, stride_col_dst,
+        ne02, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+        ne03, ne3, s03, s13, s3,
+        stream);
 }
 
 void ggml_cuda_mul_mat_vec_q(
