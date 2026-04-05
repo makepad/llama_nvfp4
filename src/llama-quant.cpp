@@ -414,6 +414,10 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
     // TODO: avoid hardcoded tensor names - use the TN_* constants
     const llm_arch arch = qs.model.arch;
 
+    if (ftype == LLAMA_FTYPE_MOSTLY_NVFP4) {
+        return new_type;
+    }
+
     auto use_more_bits = [](int i_layer, int n_layers) -> bool {
         return i_layer < n_layers/8 || i_layer >= 7*n_layers/8 || (i_layer - n_layers/8)%3 == 2;
     };
@@ -801,6 +805,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_ALL_F32:     return GGML_TYPE_F32;
 
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;
+        case LLAMA_FTYPE_MOSTLY_NVFP4:     return GGML_TYPE_NVFP4;
 
         // K-quants
         case LLAMA_FTYPE_MOSTLY_Q2_K_S:
