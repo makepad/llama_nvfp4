@@ -828,6 +828,30 @@ static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
 #endif // defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
 }
 
+static __device__ __forceinline__ float ggml_cuda_e4m3fn_to_fp32(uint8_t x) {
+#if defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
+    const uint32_t bits = x * (x != 0x7F && x != 0xFF);
+    const __hip_fp8_e4m3_fnuz xf = *reinterpret_cast<const __hip_fp8_e4m3_fnuz *>(&bits);
+    return static_cast<float>(xf);
+#else
+#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
+    const uint32_t bits = x * (x != 0x7F && x != 0xFF);
+    const __nv_fp8_e4m3 xf = *reinterpret_cast<const __nv_fp8_e4m3 *>(&bits);
+    return static_cast<float>(xf);
+#else
+    if (x == 0 || x == 0x7F || x == 0xFF) {
+        return 0.0f;
+    }
+    const int exp = (x >> 3) & 0xF;
+    const int man = x & 0x7;
+    if (exp == 0) {
+        return ldexpf((float) man, -9);
+    }
+    return ldexpf(1.0f + (float) man / 8.0f, exp - 7);
+#endif // defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
+#endif // defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
+}
+
 __device__ __forceinline__ uint8_t ggml_cuda_float_to_fp4_e2m1(float x, float e) {
     const uint8_t sign_bit = (x < 0.0f) << 3;
     float         ax       = fabsf(x) * e;

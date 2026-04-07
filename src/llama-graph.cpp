@@ -71,6 +71,37 @@ static ggml_tensor * ggml_mul_mat_aux(
     return res;
 }
 
+static ggml_tensor * ggml_mul_mat_modelopt(
+        ggml_context * ctx,
+        ggml_tensor * w,
+        ggml_tensor * in,
+        ggml_tensor * input_scale) {
+    ggml_tensor * res = ggml_mul_mat(ctx, w, in);
+
+    // Keep real ModelOpt input_scale attached to the matmul for CUDA NVFP4.
+    // This avoids the incorrect x *= input_scale approximation in the graph.
+    if (input_scale && w->type == GGML_TYPE_NVFP4) {
+        res->src[3] = input_scale;
+    }
+
+    return res;
+}
+
+static ggml_tensor * ggml_mul_mat_id_modelopt(
+        ggml_context * ctx,
+        ggml_tensor * w,
+        ggml_tensor * in,
+        ggml_tensor * ids,
+        ggml_tensor * input_scale) {
+    ggml_tensor * res = ggml_mul_mat_id(ctx, w, in, ids);
+
+    if (input_scale && w->type == GGML_TYPE_NVFP4) {
+        res->src[3] = input_scale;
+    }
+
+    return res;
+}
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -952,8 +983,18 @@ ggml_tensor * llm_graph_context::build_cvec(
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
-          ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+          ggml_tensor * w_s,
+          ggml_tensor * w_in_s) const {
+    ggml_tensor * mm_in = cur;
+
+    // ModelOpt NVFP4 input_scale is paired with FP4 activation quantization.
+    // ggml matmuls currently use unquantized/q8 activations instead, so applying
+    // input_scale here as a plain pre-matmul multiplier over-scales the result.
+    if (w_in_s && w->type != GGML_TYPE_NVFP4) {
+        mm_in = ggml_mul(ctx0, mm_in, w_in_s);
+    }
+
+    ggml_tensor * res = ggml_mul_mat_modelopt(ctx0, w, mm_in, w_in_s);
 
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
@@ -966,7 +1007,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
 
         ggml_tensor * ab_cur = ggml_mul_mat(
                 ctx0, lw->b,
-                ggml_mul_mat(ctx0, lw->a, cur)
+                ggml_mul_mat(ctx0, lw->a, mm_in)
                 );
 
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
@@ -983,8 +1024,28 @@ ggml_tensor * llm_graph_context::build_lora_mm(
 ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
-          ggml_tensor * ids) const {
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+          ggml_tensor * ids,
+          ggml_tensor * w_in_s) const {
+    ggml_tensor * mm_in = cur;
+    ggml_tensor * mm_out_s = nullptr;
+
+    if (w_in_s && w->type != GGML_TYPE_NVFP4) {
+        if (ggml_is_scalar(w_in_s)) {
+            mm_in = ggml_mul(ctx0, mm_in, w_in_s);
+        } else {
+            const int64_t n_tokens = ids->ne[1];
+            const int64_t n_expert = w_in_s->ne[0];
+
+            mm_out_s = ggml_reshape_3d(ctx0, w_in_s, 1, n_expert, 1);
+            mm_out_s = ggml_repeat_4d(ctx0, mm_out_s, 1, n_expert, n_tokens, 1);
+            mm_out_s = ggml_get_rows(ctx0, mm_out_s, ids); // [1, n_expert_used, n_tokens]
+        }
+    }
+
+    ggml_tensor * res = ggml_mul_mat_id_modelopt(ctx0, w, mm_in, ids, w_in_s);
+    if (mm_out_s) {
+        res = ggml_mul(ctx0, res, mm_out_s);
+    }
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
         if (lw == nullptr) {
@@ -997,9 +1058,13 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
 
         ggml_tensor * ab_cur = ggml_mul_mat_id(
                 ctx0, lw->b,
-                ggml_mul_mat_id(ctx0, lw->a, cur, ids),
+                ggml_mul_mat_id(ctx0, lw->a, mm_in, ids),
                 ids
                 );
+
+        if (mm_out_s) {
+            ab_cur = ggml_mul(ctx0, ab_cur, mm_out_s);
+        }
 
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
         res = ggml_add(ctx0, res, ab_cur);
@@ -1057,8 +1122,11 @@ ggml_tensor * llm_graph_context::build_ffn(
          ggml_tensor * act_scales,
      llm_ffn_op_type   type_op,
    llm_ffn_gate_type   type_gate,
-                 int   il) const {
-    ggml_tensor * tmp = up ? build_lora_mm(up, cur) : cur;
+                 int   il,
+         ggml_tensor * up_in_s,
+         ggml_tensor * gate_in_s,
+         ggml_tensor * down_in_s) const {
+    ggml_tensor * tmp = up ? build_lora_mm(up, cur, nullptr, up_in_s) : cur;
     cb(tmp, "ffn_up", il);
 
     if (up_b) {
@@ -1075,12 +1143,12 @@ ggml_tensor * llm_graph_context::build_ffn(
         switch (type_gate) {
             case LLM_FFN_SEQ:
                 {
-                    cur = build_lora_mm(gate, tmp);
+                    cur = build_lora_mm(gate, tmp, nullptr, gate_in_s);
                     cb(cur, "ffn_gate", il);
                 } break;
             case LLM_FFN_PAR:
                 {
-                    cur = build_lora_mm(gate, cur);
+                    cur = build_lora_mm(gate, cur, nullptr, gate_in_s);
                     cb(cur, "ffn_gate", il);
                 } break;
         }
@@ -1184,7 +1252,7 @@ ggml_tensor * llm_graph_context::build_ffn(
     }
 
     if (down) {
-        cur = build_lora_mm(down, cur);
+        cur = build_lora_mm(down, cur, nullptr, down_in_s);
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
             // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
             ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
@@ -1225,7 +1293,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * gate_up_exps,
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
-         ggml_tensor * down_exps_s) const {
+         ggml_tensor * down_exps_s,
+         ggml_tensor * up_exps_in_s,
+         ggml_tensor * gate_exps_in_s,
+         ggml_tensor * down_exps_in_s) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -1245,7 +1316,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         /* gate_up_exps_b */ nullptr,
         up_exps_s,
         gate_exps_s,
-        down_exps_s
+        down_exps_s,
+        up_exps_in_s,
+        gate_exps_in_s,
+        down_exps_in_s
     );
 }
 
@@ -1272,7 +1346,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * gate_up_exps_b,
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
-         ggml_tensor * down_exps_s) const {
+         ggml_tensor * down_exps_s,
+         ggml_tensor * up_exps_in_s,
+         ggml_tensor * gate_exps_in_s,
+         ggml_tensor * down_exps_in_s) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -1416,7 +1493,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_in_s); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (gate_up_exps_b) {
@@ -1440,7 +1517,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_in_s); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_b) {
@@ -1458,7 +1535,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_in_s); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -1548,7 +1625,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_in_s); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_b) {
@@ -1851,6 +1928,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
 
+    // TurboQuant note: graph-side Q rotation (pre-rotate-queries) is implemented below
+    // in the flash-attn path. The VEC kernel bug (wrong Q/K stride in
+    // vec_dot_fattn_vec_KQ_turbo3_0) was fixed in fattn-common.cuh to match f16 pattern.
+
     ggml_tensor * cur;
 
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
@@ -1876,6 +1957,20 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+
+        // TurboQuant: inverse WHT on FA output when V values are WHT-rotated.
+        // For MLA, V is a view of K with different ne[0] (e.g. V=512, K=576).
+        // Group size must come from K (which determines the WHT rotation), not V.
+        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
+            const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
+            const ggml_tensor * group_src = k_is_turbo ? k : v;
+            const int turbo_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
+            if (cur->ne[0] % turbo_group == 0) {
+                if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
+                ggml_tensor * innerq_scale = mctx ? mctx->get_turbo_innerq_scale_inv() : nullptr;
+                cur = ggml_turbo_wht(ctx0, cur, 1, turbo_group, innerq_scale);  // 1 = inverse
+            }
+        }
 
         if (v_mla) {
 #if 0
@@ -1943,6 +2038,18 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
         cb(kqv, "kqv", il);
 
+        // TurboQuant: inverse WHT on attention output (non-FA path)
+        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
+            const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
+            const ggml_tensor * group_src = k_is_turbo ? k : v;
+            const int turbo_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
+            if (kqv->ne[0] % turbo_group == 0) {
+                if (!ggml_is_contiguous(kqv)) { kqv = ggml_cont(ctx0, kqv); }
+                ggml_tensor * innerq_scale = mctx ? mctx->get_turbo_innerq_scale_inv() : nullptr;
+                kqv = ggml_turbo_wht(ctx0, kqv, 1, turbo_group, innerq_scale);
+            }
+        }
+
         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
         if (v_mla) {
             kqv = ggml_mul_mat(ctx0, v_mla, kqv);
@@ -1959,6 +2066,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
         }
     }
+
+    // TurboQuant: graph-side inverse WHT on attention output (undoes V rotation)
 
     ggml_build_forward_expand(gf, cur);
 
@@ -1998,7 +2107,9 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * sinks,
         ggml_tensor * v_mla,
             float     kq_scale,
-            int       il) const {
+            int       il,
+        ggml_tensor * wo_s,
+        ggml_tensor * wo_in_s) const {
     GGML_UNUSED(n_tokens);
 
     // these nodes are added to the graph together so that they are not reordered
@@ -2024,7 +2135,7 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(cur, "kqv_out", il);
 
     if (wo) {
-        cur = build_lora_mm(wo, cur);
+        cur = build_lora_mm(wo, cur, wo_s, wo_in_s);
     }
 
     if (wo_b) {
@@ -2082,7 +2193,9 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * sinks,
         ggml_tensor * v_mla, // TODO: remove
             float     kq_scale,
-            int       il) const {
+            int       il,
+        ggml_tensor * wo_s,
+        ggml_tensor * wo_in_s) const {
     GGML_ASSERT(v_mla == nullptr);
 
     if (inp->self_k_rot) {
@@ -2118,15 +2231,48 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
+    // Q shape: (n_embd_head, n_head, n_tokens)
+    // For zero-padded models (head_dim not 128-aligned), pad Q to match padded K dim first.
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+        // Pad Q per-head to next multiple of 128 if needed
+        if (q->ne[0] % 128 != 0) {
+            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
+            q = ggml_pad(ctx0, q, pad, 0, 0, 0);
+        }
+        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+        ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
+        q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size from q->ne[0]
+    }
+
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
+
+    // TurboQuant: if V was padded, the output has padded dimensions.
+    // Extract original V head_dim after inverse WHT (applied inside build_attn_mha).
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+        const int64_t orig_v_head = hparams.n_embd_head_v(il);
+        // cur is 2D: (n_embd_head * n_head, n_tokens) after build_attn_mha
+        const int64_t padded_v_head = v->ne[0];
+        if (padded_v_head != orig_v_head) {
+            // Reshape to 4D, extract original head_dim, reshape back to 2D
+            const int64_t n_head_v = hparams.n_head_kv(il);
+            const int64_t n_tokens_cur = cur->ne[1];
+            cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
+            // ggml_view_3d to extract first orig_v_head elements per head
+            cur = ggml_view_3d(ctx0, cur, orig_v_head, n_head_v, n_tokens_cur,
+                               cur->nb[1], cur->nb[2], 0);
+            cur = ggml_cont(ctx0, cur);
+            cur = ggml_reshape_2d(ctx0, cur, orig_v_head * n_head_v, n_tokens_cur);
+        }
+    }
 
     if (inp->self_v_rot) {
         cur = ggml_mul_mat_aux(ctx0, cur, inp->self_v_rot);
     }
 
     if (wo) {
-        cur = build_lora_mm(wo, cur);
+        cur = build_lora_mm(wo, cur, wo_s, wo_in_s);
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
             // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
             ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
@@ -2180,7 +2326,9 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * sinks,
         ggml_tensor * v_mla,
             float     kq_scale,
-            int       il) const {
+            int       il,
+        ggml_tensor * wo_s,
+        ggml_tensor * wo_in_s) const {
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
     // expand k later to enable rope fusion which directly writes into k-v cache
@@ -2203,11 +2351,41 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
+    // TurboQuant: pre-rotate Q for K-only (MLA) attention
+    // For zero-padded models, pad Q to match padded K dim first.
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+        // Pad Q per-head to next multiple of 128 if needed
+        if (q->ne[0] % 128 != 0) {
+            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
+            q = ggml_pad(ctx0, q, pad, 0, 0, 0);
+        }
+        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+        ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
+        q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size
+    }
+
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
+    // TurboQuant: if V was padded (MLA: V is view of K, may have padded dim),
+    // extract original V head_dim after inverse WHT.
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+        const int64_t orig_v_head = v_cur->ne[0];  // original V head_dim from model
+        const int64_t padded_v_head = v->ne[0];     // padded V head_dim in cache
+        if (padded_v_head != orig_v_head) {
+            // cur is 2D: (padded_v_head * n_head, n_tokens) after build_attn_mha
+            const int64_t n_head_v = hparams.n_head_kv(il);
+            const int64_t n_tokens_cur = cur->ne[1];
+            cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
+            cur = ggml_view_3d(ctx0, cur, orig_v_head, n_head_v, n_tokens_cur,
+                               cur->nb[1], cur->nb[2], 0);
+            cur = ggml_cont(ctx0, cur);
+            cur = ggml_reshape_2d(ctx0, cur, orig_v_head * n_head_v, n_tokens_cur);
+        }
+    }
+
     if (wo) {
-        cur = build_lora_mm(wo, cur);
+        cur = build_lora_mm(wo, cur, wo_s, wo_in_s);
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE) {
             // GLM4 and GLM4_MOE seem to have numerical issues with half-precision accumulators
             ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
@@ -2232,7 +2410,9 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * sinks,
         ggml_tensor * v_mla,
             float     kq_scale,
-            int       il) const {
+            int       il,
+        ggml_tensor * wo_s,
+        ggml_tensor * wo_in_s) const {
     if (inp->self_k_rot) {
         q_cur = ggml_mul_mat_aux(ctx0, q_cur, inp->self_k_rot);
         if (k_cur) {
@@ -2282,15 +2462,41 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    // TurboQuant: pre-rotate Q for ISWA attention (pad to 128-aligned if needed)
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+        if (q->ne[0] % 128 != 0) {
+            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
+            q = ggml_pad(ctx0, q, pad, 0, 0, 0);
+        }
+        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+        ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
+        q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);
+    }
+
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
+
+    // TurboQuant: if V was padded, extract original V head_dim after inverse WHT
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+        const int64_t orig_v_head = hparams.n_embd_head_v(il);
+        const int64_t padded_v_head = v->ne[0];
+        if (padded_v_head != orig_v_head) {
+            const int64_t n_head_v = hparams.n_head_kv(il);
+            const int64_t n_tokens_cur = cur->ne[1];
+            cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_tokens_cur);
+            cur = ggml_view_3d(ctx0, cur, orig_v_head, n_head_v, n_tokens_cur,
+                               cur->nb[1], cur->nb[2], 0);
+            cur = ggml_cont(ctx0, cur);
+            cur = ggml_reshape_2d(ctx0, cur, orig_v_head * n_head_v, n_tokens_cur);
+        }
+    }
 
     if (inp->self_v_rot) {
         cur = ggml_mul_mat_aux(ctx0, cur, inp->self_v_rot);
     }
 
     if (wo) {
-        cur = build_lora_mm(wo, cur);
+        cur = build_lora_mm(wo, cur, wo_s, wo_in_s);
     }
 
     if (wo_b) {
@@ -2328,7 +2534,9 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * sinks,
         ggml_tensor * v_mla,
             float     kq_scale,
-            int       il) const {
+            int       il,
+        ggml_tensor * wo_s,
+        ggml_tensor * wo_in_s) const {
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
     ggml_build_forward_expand(gf, q_cur);
@@ -2345,7 +2553,7 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(cur, "kqv_out", il);
 
     if (wo) {
-        cur = build_lora_mm(wo, cur);
+        cur = build_lora_mm(wo, cur, wo_s, wo_in_s);
     }
 
     if (wo_b) {

@@ -7684,6 +7684,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             if (!layer.ffn_up_exps_s && layer.ffn_up_exps) {
                 layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
             }
+            if (!layer.ffn_gate_up_exps_s && layer.ffn_gate_up_exps) {
+                layer.ffn_gate_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+            }
 
             // recurrent / linear-attention weight scales (per-tensor, shape {1})
             if (!layer.ssm_in_s && layer.ssm_in) {
@@ -7735,6 +7738,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             }
             if (!layer.ffn_up_exps_in_s && layer.ffn_up_exps) {
                 layer.ffn_up_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+            }
+            if (!layer.ffn_gate_up_exps_in_s && layer.ffn_gate_up_exps) {
+                layer.ffn_gate_up_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_gate_shexp_in_s && layer.ffn_gate_shexp) {
                 layer.ffn_gate_shexp_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
